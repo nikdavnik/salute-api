@@ -11,6 +11,7 @@ DB_CONF = {
     "user": os.getenv("DB_USER", "myuser"),
     "password": os.getenv("DB_PASSWORD", "mypassword"),
     "database": os.getenv("DB_NAME", "mydb"),
+    "port": os.getenv("DB_PORT", "3306"),
     "charset": "utf8mb4",
     "use_unicode": True,
 }
