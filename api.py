@@ -6,6 +6,9 @@ from typing import Optional
 
 app = FastAPI()
 
+from dotenv import load_dotenv
+load_dotenv()
+
 DB_CONF = {
     "host": os.getenv("DB_HOST", "localhost"),
     "user": os.getenv("DB_USER", "myuser"),
