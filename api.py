@@ -2,13 +2,23 @@ import os
 import json
 import mysql.connector
 from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
 app = FastAPI()
 
-# Database configuration from env
+# ✅ Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or ["http://localhost:8080"] for stricter control
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Database configuration
 DB_CONF = {
     "host": os.getenv("DB_HOST", "localhost"),
     "user": os.getenv("DB_USER", "myuser"),
@@ -19,8 +29,8 @@ DB_CONF = {
     "use_unicode": True,
 }
 
-# API Key from env
-API_KEY = os.getenv("API_KEY", "changeme")  # set in .env or App Platform settings
+# API key
+API_KEY = os.getenv("API_KEY", "changeme")
 
 def verify_api_key(x_api_key: str = Header(...)):
     if x_api_key != API_KEY:
@@ -33,7 +43,7 @@ def get_conn():
 def get_keypoints(
     word: str,
     frame: Optional[int] = None,
-    _: None = Depends(verify_api_key),  # enforce API key
+    _: None = Depends(verify_api_key),
 ):
     conn = get_conn()
     cur = conn.cursor(dictionary=True)
