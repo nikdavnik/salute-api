@@ -28,7 +28,7 @@ REDIS_USERNAME = os.getenv("REDIS_USERNAME", None) # <-- CRITICAL: Now loads the
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 
 # Cache entries expire after 5 minutes (300 seconds)
-CACHE_TIMEOUT_SECONDS = 300 
+CACHE_TIMEOUT_SECONDS = 86400
 
 # Initialize the Redis client globally
 try:
