@@ -5,7 +5,8 @@ from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from dotenv import load_dotenv
-import time # <-- New import for time-based cache
+import redis # <-- New import for Redis/Valkey
+from redis.exceptions import ConnectionError # <-- Handle connection issues
 
 load_dotenv()
 app = FastAPI()
@@ -19,11 +20,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- CACHING CONFIGURATION ---
-# Stores keypoints for words (where frame is None).
-# Format: { "word": {"timestamp": 1678886400.0, "data": [...] } }
-WORD_CACHE = {}
-CACHE_TIMEOUT_SECONDS = 86400 # Cache entries expire after 3 seconds
+# --- REDIS/VALKEY CACHING CONFIGURATION ---
+# Use environment variables for Valkey/Redis connection
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
+
+# Cache entries expire after 5 minutes (300 seconds)
+CACHE_TIMEOUT_SECONDS = 300 
+
+# Initialize the Redis client globally
+# Use decode_responses=True to automatically convert responses (keys/values) to Python strings
+try:
+    # Use password if provided in the environment (common in cloud providers)
+    REDIS_CLIENT = redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        password=REDIS_PASSWORD,
+        decode_responses=True,
+        socket_timeout=5, # Timeout for connection/socket operations
+    )
+    # Test the connection immediately
+    REDIS_CLIENT.ping()
+    print("✅ Successfully connected to Redis/Valkey cache.")
+    IS_CACHE_AVAILABLE = True
+except ConnectionError as e:
+    print(f"⚠️ Failed to connect to Redis/Valkey at {REDIS_HOST}:{REDIS_PORT}. Falling back to DB-only operation. Error: {e}")
+    REDIS_CLIENT = None
+    IS_CACHE_AVAILABLE = False
+
 
 # Database configuration
 DB_CONF = {
@@ -52,25 +77,31 @@ def get_keypoints(
     frame: Optional[int] = None,
     _: None = Depends(verify_api_key),
 ):
-    # --- 1. CACHE LOOKUP ---
     # Only cache requests that retrieve ALL frames for a word (frame is None)
-    if frame is None:
-        cache_entry = WORD_CACHE.get(word)
-        current_time = time.time()
-        
-        if cache_entry and (current_time - cache_entry["timestamp"] < CACHE_TIMEOUT_SECONDS):
-            print(f"✅ Cache Hit: Serving '{word}' from memory.")
-            return cache_entry["data"]
-        
-        print(f"🟡 Cache Miss/Expired: Querying database for '{word}'.")
-        # Proceed to DB query if not in cache or expired
+    is_cacheable_request = frame is None and IS_CACHE_AVAILABLE
+    
+    # --- 1. CACHE LOOKUP (Redis/Valkey) ---
+    if is_cacheable_request:
+        try:
+            # Attempt to get the JSON string from Redis
+            cached_json = REDIS_CLIENT.get(word) 
+            
+            if cached_json:
+                print(f"✅ Cache Hit: Serving '{word}' from Redis/Valkey.")
+                # Deserialize the JSON string back to a Python list
+                return json.loads(cached_json)
+            
+            print(f"🟡 Cache Miss: Querying database for '{word}'.")
+        except Exception as e:
+            # Log cache error but proceed to DB
+            print(f"⚠️ Redis/Valkey read error for '{word}': {e}")
         
     # --- 2. DATABASE QUERY ---
     conn = get_conn()
     cur = conn.cursor(dictionary=True)
 
     if frame is not None:
-        # If a specific frame is requested, query the DB directly (do not cache this result)
+        # If a specific frame is requested, query the DB directly
         cur.execute(
             "SELECT frame_number, keypoints FROM words WHERE word = %s AND frame_number = %s",
             (word, frame),
@@ -91,13 +122,17 @@ def get_keypoints(
     for r in rows:
         r["keypoints"] = json.loads(r["keypoints"])
 
-    # --- 4. CACHE STORE ---
-    # If we successfully fetched all frames (frame is None), store the result in the cache
-    if frame is None and rows:
-        WORD_CACHE[word] = {
-            "timestamp": time.time(),
-            "data": rows
-        }
-        print(f"💾 Cache Stored: '{word}' added/updated.")
+    # --- 4. CACHE STORE (Redis/Valkey) ---
+    if is_cacheable_request and rows:
+        try:
+            # Serialize the Python list of dicts to a JSON string
+            json_to_cache = json.dumps(rows)
+            
+            # Store the JSON string in Redis, setting an expiration time (EX)
+            REDIS_CLIENT.set(word, json_to_cache, ex=CACHE_TIMEOUT_SECONDS)
+            print(f"💾 Cache Stored: '{word}' added/updated in Redis/Valkey.")
+        except Exception as e:
+            # Log cache error but return result anyway
+            print(f"⚠️ Redis/Valkey write error for '{word}': {e}")
 
     return rows
