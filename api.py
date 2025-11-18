@@ -1,20 +1,48 @@
+# server.py
+# Updated FastAPI server with:
+# - MySQL connection pooling (mysql.connector.pooling.MySQLConnectionPool)
+# - Binary Redis client for caching pre-serialized gzipped bytes
+# - GZipMiddleware (for clients that accept it)
+# - Cache hit returns gzipped bytes directly to avoid re-serialization
+# - ORJSON (if available) for fast (de)serialization, fallback to json
+# - Optional response-size reductions: limit frames and rounding of floats
+# - Simple timing instrumentation printed to stdout
+#
+# Notes:
+# - Expects environment variables in valkey.env (same as your previous file)
+# - To use orjson, pip install orjson
+# - To use Redis SSL or different settings, adjust env variables accordingly
+# - This file is a drop-in replacement for your previous server.py (keep your valkey.env)
 import os
-import json
 import time
-from typing import Optional
+import json
+import gzip
+from typing import Optional, List, Any, Dict
 
-import mysql.connector
-from mysql.connector import pooling
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import Response
 from dotenv import load_dotenv
+
 import redis
 from redis.exceptions import ConnectionError
 
-# Load environment variables
+import mysql.connector
+from mysql.connector import pooling
+
+# Try to use orjson for speed; fall back to built-in json
+try:
+    import orjson  # type: ignore
+    _HAS_ORJSON = True
+except Exception:
+    _HAS_ORJSON = False
+
 load_dotenv("valkey.env")
+
 app = FastAPI()
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,38 +51,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# REDIS/VALKEY CONFIG
+# GZip middleware for automatic compression (for clients that support it).
+# We still serve pre-gzipped bytes for cache hits to avoid recomputing JSON; middleware won't re-compress bytes that already have Content-Encoding set.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+# Redis config (binary client: decode_responses=False so we store bytes)
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_USERNAME = os.getenv("REDIS_USERNAME", None)
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
-# longer cache TTL by default
+REDIS_DB = int(os.getenv("REDIS_DB", 0))
 CACHE_TIMEOUT_SECONDS = int(os.getenv("CACHE_TIMEOUT_SECONDS", 86400))
 
-REDIS_CLIENT = None
+REDIS_BYTES_CLIENT = None
 IS_CACHE_AVAILABLE = False
 try:
-    REDIS_CLIENT = redis.Redis(
+    REDIS_BYTES_CLIENT = redis.Redis(
         host=REDIS_HOST,
         port=REDIS_PORT,
-        db=0,
+        db=REDIS_DB,
         username=REDIS_USERNAME,
         password=REDIS_PASSWORD,
-        decode_responses=True,
-        socket_timeout=2,   # lower timeout so calls fail fast
+        decode_responses=False,  # important: store bytes
+        socket_timeout=2,
         socket_connect_timeout=2,
-        ssl=True,
+        ssl=os.getenv("REDIS_USE_SSL", "true").lower() in ("1", "true", "yes"),
         ssl_cert_reqs=None,
     )
-    REDIS_CLIENT.ping()
-    print("✅ Successfully connected to Redis/Valkey cache.")
+    REDIS_BYTES_CLIENT.ping()
     IS_CACHE_AVAILABLE = True
+    print("✅ Connected to Redis (binary client).")
 except Exception as e:
-    print(f"⚠️ Failed to connect to Redis/Valkey: {e}")
-    REDIS_CLIENT = None
+    print(f"⚠️ Redis (binary) unavailable: {e}")
+    REDIS_BYTES_CLIENT = None
     IS_CACHE_AVAILABLE = False
 
-# DATABASE CONFIG
+# Database config
 DB_CONF = {
     "host": os.getenv("DB_HOST", "localhost"),
     "user": os.getenv("DB_USER", "myuser"),
@@ -63,23 +95,26 @@ DB_CONF = {
     "port": int(os.getenv("DB_PORT", 3306)),
     "charset": "utf8mb4",
     "use_unicode": True,
-    # Optional: set a connect timeout so pool operations fail fast
+    # connection_timeout helps pool.get_connection() fail fast if the DB is unreachable
     "connection_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", 10)),
+    # If your managed DB requires SSL, provide ssl_ca, ssl_cert, ssl_key or use ssl_disabled=False here.
+    # Example for mysql.connector: "ssl_ca": "/path/to/ca.pem"
 }
 
-# Create a connection pool once at startup
 POOL_SIZE = int(os.getenv("DB_POOL_SIZE", 10))
+POOL: Optional[pooling.MySQLConnectionPool] = None
 try:
     POOL = pooling.MySQLConnectionPool(
-        pool_name="mypool",
+        pool_name="keypoints_pool",
         pool_size=POOL_SIZE,
         pool_reset_session=True,
         **DB_CONF
     )
-    print(f"✅ DB pool created (size={POOL_SIZE}).")
+    print(f"✅ MySQL pool created (size={POOL_SIZE}).")
 except Exception as e:
     POOL = None
-    print(f"⚠️ Could not create DB pool: {e}")
+    print(f"⚠️ Failed to create MySQL pool: {e}")
+
 
 API_KEY = os.getenv("API_KEY", "changeme")
 
@@ -90,53 +125,123 @@ def verify_api_key(x_api_key: str = Header(...)):
 
 
 def get_conn():
-    if POOL is None:
-        # Fallback: try a direct connection (not recommended for production)
+    """
+    Get a connection from the pool if available, else create a new connection (fallback).
+    Caller must call conn.close() to return to pool.
+    """
+    if POOL is not None:
         try:
-            return mysql.connector.connect(**DB_CONF)
+            return POOL.get_connection()
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Database connection error: {e}")
+            # Fall through to attempt direct connect
+            print("⚠️ Pool get_connection failed:", e)
     try:
-        return POOL.get_connection()
+        return mysql.connector.connect(**DB_CONF)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB pool error: {e}")
+        raise HTTPException(status_code=500, detail=f"Database connection error: {e}")
+
+
+# Helpers for JSON (serialize/deserialize) with orjson fallback
+def dumps_json_bytes(obj: Any) -> bytes:
+    if _HAS_ORJSON:
+        return orjson.dumps(obj)
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def loads_json(s: bytes) -> Any:
+    if _HAS_ORJSON:
+        return orjson.loads(s)
+    return json.loads(s.decode("utf-8"))
+
+
+def round_keypoints(rows: List[Dict[str, Any]], decimals: Optional[int]) -> None:
+    """
+    In-place rounding of numeric values inside 'keypoints' fields to reduce payload size.
+    Expects keypoints to be either:
+      - JSON array of arrays: [[x,y,...],[x,y,...],...]
+      - or arbitrary nested lists/dicts (we handle lists of lists and numbers)
+    """
+    if decimals is None:
+        return
+    for r in rows:
+        kp = r.get("keypoints")
+        if kp is None:
+            continue
+        # If keypoints already deserialized (python list)
+        if isinstance(kp, (list, tuple)):
+            def round_val(v):
+                try:
+                    return round(float(v), decimals)
+                except Exception:
+                    return v
+            def recurse(value):
+                if isinstance(value, (list, tuple)):
+                    return [recurse(x) for x in value]
+                elif isinstance(value, dict):
+                    return {k: recurse(v) for k, v in value.items()}
+                else:
+                    return round_val(value)
+            r["keypoints"] = recurse(kp)
+        # If it's a string (shouldn't be here because we decode earlier), skip.
+
+
+def cache_key_for_word(word: str) -> str:
+    # Simple prefix to avoid collisions and make debugging easier
+    return f"keypoints:gz:{word}"
 
 
 @app.get("/api/keypoints/{word}")
-def get_keypoints(word: str, frame: Optional[int] = None, _: None = Depends(verify_api_key)):
-    t0 = time.perf_counter()
+def get_keypoints(
+    word: str,
+    frame: Optional[int] = Query(None, description="Specific frame number to retrieve"),
+    limit: Optional[int] = Query(None, description="Limit number of frames returned (for pagination)"),
+    round_decimals: Optional[int] = Query(3, description="Round floats to this many decimals to shrink payload; set -1 to disable"),
+    _: None = Depends(verify_api_key),
+):
+    """
+    Returns keypoints for a given word.
+    - If frame is provided: returns only that frame (not cached).
+    - If frame is None and limit is None: attempt to serve from Redis cached gzipped JSON bytes.
+    - The endpoint will cache full responses (no frame/limit) as gzipped bytes for fast subsequent responses.
+    """
+    t_start = time.perf_counter()
 
-    is_cacheable_request = frame is None and IS_CACHE_AVAILABLE
+    is_full_cacheable = frame is None and (limit is None) and IS_CACHE_AVAILABLE
 
-    # 1) CACHE LOOKUP
-    try:
-        t_cache_start = time.perf_counter()
-        if is_cacheable_request and REDIS_CLIENT:
-            cached_json = REDIS_CLIENT.get(word)
+    # Try cache hit (gzipped bytes)
+    if is_full_cacheable and REDIS_BYTES_CLIENT:
+        try:
+            t_cache_start = time.perf_counter()
+            key = cache_key_for_word(word)
+            cached = REDIS_BYTES_CLIENT.get(key)
             t_cache_after = time.perf_counter()
-            print(f"timing: cache_lookup={t_cache_after - t_cache_start:.4f}s")
-            if cached_json:
-                print(f"✅ Cache Hit: Serving '{word}' from Redis.")
-                print(f"timing: total={(time.perf_counter()-t0):.4f}s")
-                return json.loads(cached_json)
-        else:
-            t_cache_after = time.perf_counter()
-            print(f"timing: cache_lookup_skipped={(t_cache_after - t_cache_start):.4f}s")
-    except Exception as e:
-        print(f"⚠️ Redis read error for '{word}': {e}")
+            print(f"timing: cache_lookup={(t_cache_after - t_cache_start):.4f}s")
+            if cached:
+                # cached is gzipped bytes
+                print(f"✅ Cache hit for '{word}' ({len(cached)} bytes gzipped). total={(time.perf_counter()-t_start):.4f}s")
+                headers = {"Content-Encoding": "gzip"}
+                return Response(content=cached, media_type="application/json", headers=headers)
+            else:
+                print(f"🟡 Cache miss for '{word}'")
+        except Exception as e:
+            print(f"⚠️ Redis read error for '{word}': {e}")
 
-    # 2) DATABASE QUERY
-    t_db_connect_start = time.perf_counter()
+    # Build and execute DB query
+    t_db_conn_start = time.perf_counter()
     conn = get_conn()
-    t_db_connected = time.perf_counter()
-    cur = conn.cursor(dictionary=True)
+    t_db_conn_after = time.perf_counter()
 
+    cur = conn.cursor(dictionary=True)
     query = "SELECT frame_number, keypoints FROM words WHERE word = %s"
     params = [word]
     if frame is not None:
         query += " AND frame_number = %s"
         params.append(frame)
     query += " ORDER BY frame_number"
+    if limit is not None and frame is None:
+        # Simple LIMIT for pagination when frame isn't specified
+        query += " LIMIT %s"
+        params.append(limit)
 
     t_query_start = time.perf_counter()
     try:
@@ -147,34 +252,93 @@ def get_keypoints(word: str, frame: Optional[int] = None, _: None = Depends(veri
         raise HTTPException(status_code=500, detail=f"Query error: {e}")
     t_query_after = time.perf_counter()
 
+    # fetchall
     rows = cur.fetchall()
     t_fetch_after = time.perf_counter()
     cur.close()
-    conn.close()  # returns connection to pool
+    conn.close()
     t_db_done = time.perf_counter()
 
-    print(f"timing: db_connect={t_db_connected - t_db_connect_start:.4f}s query_execute={t_query_after - t_query_start:.4f}s fetch={t_fetch_after - t_query_after:.4f}s db_total={t_db_done - t_db_connect_start:.4f}s")
+    print(
+        f"timing: db_connect={(t_db_conn_after - t_db_conn_start):.4f}s "
+        f"query={(t_query_after - t_query_start):.4f}s fetch={(t_fetch_after - t_query_after):.4f}s "
+        f"db_total={(t_db_done - t_db_conn_start):.4f}s"
+    )
 
-    # 3) POST-PROCESSING (JSON decode)
+    # Post-process: keypoints field contains JSON string in DB -> decode per-row
     t_decode_start = time.perf_counter()
     for r in rows:
-        try:
-            r["keypoints"] = json.loads(r["keypoints"])
-        except Exception:
-            r["keypoints"] = []
+        kp_raw = r.get("keypoints")
+        if isinstance(kp_raw, (bytes, bytearray)):
+            # some connectors return bytes; decode
+            try:
+                kp_raw = kp_raw.decode("utf-8")
+            except Exception:
+                kp_raw = None
+        if isinstance(kp_raw, str):
+            try:
+                # decode JSON string into Python structure
+                r["keypoints"] = json.loads(kp_raw)
+            except Exception:
+                # best-effort: set empty list
+                r["keypoints"] = []
+        # else assume already a Python object
     t_decode_after = time.perf_counter()
     print(f"timing: json_decode={(t_decode_after - t_decode_start):.4f}s")
 
-    # 4) CACHE STORE
-    if is_cacheable_request and rows and REDIS_CLIENT:
+    # Optionally round to reduce payload
+    if isinstance(round_decimals, int) and round_decimals >= 0:
+        t_round_start = time.perf_counter()
+        round_keypoints(rows, round_decimals)
+        t_round_after = time.perf_counter()
+        print(f"timing: rounding={(t_round_after - t_round_start):.4f}s")
+
+    # On full-cacheable responses, store gzipped serialized bytes in Redis
+    if is_full_cacheable and REDIS_BYTES_CLIENT and rows:
         try:
-            t_cache_write_start = time.perf_counter()
-            REDIS_CLIENT.set(word, json.dumps(rows), ex=CACHE_TIMEOUT_SECONDS)
+            t_serialize_start = time.perf_counter()
+            json_bytes = dumps_json_bytes(rows)
+            gzipped = gzip.compress(json_bytes, compresslevel=6)
+            t_serialize_after = time.perf_counter()
+            # store bytes
+            key = cache_key_for_word(word)
+            REDIS_BYTES_CLIENT.set(key, gzipped, ex=CACHE_TIMEOUT_SECONDS)
             t_cache_write_after = time.perf_counter()
-            print(f"timing: cache_write={(t_cache_write_after - t_cache_write_start):.4f}s")
+            print(
+                f"timing: serialize={(t_serialize_after - t_serialize_start):.4f}s "
+                f"cache_write={(t_cache_write_after - t_serialize_after):.4f}s "
+                f"gz_bytes={len(gzipped)}"
+            )
         except Exception as e:
             print(f"⚠️ Redis write error for '{word}': {e}")
 
-    t_total = time.perf_counter() - t0
-    print(f"timing: total={t_total:.4f}s")
-    return rows
+    t_total = time.perf_counter() - t_start
+    print(f"timing: total={(t_total):.4f}s")
+
+    # If this wasn't cached already, we still should return JSON (not gzipped) so that FastAPI/GZipMiddleware can compress on the fly if client accepts gzip.
+    # However, to preserve consistency and avoid re-serializing twice, we will return gzipped content when we serialized above.
+    # If we didn't serialize above (e.g., non-cacheable request), return serialized bytes (not gzipped) and let GZipMiddleware handle compression.
+    if is_full_cacheable and REDIS_BYTES_CLIENT:
+        # We already stored gzipped bytes; use gzipped variable if present
+        try:
+            # If gzipped exists from above, return it. Otherwise, create gzipped here to be consistent.
+            gz = locals().get("gzipped")
+            if gz is None:
+                json_bytes = dumps_json_bytes(rows)
+                gz = gzip.compress(json_bytes, compresslevel=6)
+            headers = {"Content-Encoding": "gzip"}
+            return Response(content=gz, media_type="application/json", headers=headers)
+        except Exception as e:
+            print(f"⚠️ Final gzipped return failed: {e}")
+
+    # Non-cacheable path (single frame or limited). Return JSON (FastAPI will compress if client accepts).
+    try:
+        if _HAS_ORJSON:
+            # orjson returns bytes already
+            return Response(content=orjson.dumps(rows), media_type="application/json")
+        else:
+            return Response(content=json.dumps(rows, ensure_ascii=False), media_type="application/json")
+    except Exception as e:
+        # As a last fallback, return rows via FastAPI auto-serialization (slower)
+        print("⚠️ Response serialization failed, falling back to default response:", e)
+        return rows
